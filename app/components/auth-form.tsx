@@ -1,37 +1,62 @@
 "use client";
 
 import { FormEvent, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useRouter } from "next/navigation";
+import { useMutation } from "@tanstack/react-query";
+import { GitBranch, Mail, ShieldCheck } from "lucide-react";
 import { authClient } from "@/app/lib/auth-client";
 import { signInSchema, signUpSchema } from "@/app/lib/auth-schemas";
-import { useAuthStore } from "@/app/lib/auth-store";
 
-export default function AuthForm() {
-  const router = useRouter();
-  const queryClient = useQueryClient();
-  const { mode, setMode } = useAuthStore();
+type AuthMode = "sign-in" | "sign-up" | "forgot" | "verify";
+
+type AuthFormProps = {
+  initialMode?: "sign-in" | "sign-up";
+  onSuccess?: () => void;
+};
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+export default function AuthForm({
+  initialMode = "sign-in",
+  onSuccess,
+}: AuthFormProps) {
+  const [mode, setMode] = useState<AuthMode>(initialMode);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
   const emailMutation = useMutation({
     mutationFn: async () => {
+      if (mode === "forgot") {
+        const result = await authClient.requestPasswordReset({
+          email,
+          redirectTo: `${window.location.origin}/reset-password`,
+        });
+        if (result.error) throw new Error(result.error.message);
+        return "forgot" as const;
+      }
+
       const result =
         mode === "sign-in"
           ? await authClient.signIn.email({ email, password })
           : await authClient.signUp.email({ name, email, password });
-
-      if (result.error) {
-        throw new Error(result.error.message ?? "Authentication failed.");
-      }
-
-      return result.data;
+      if (result.error) throw new Error(result.error.message);
+      return mode;
     },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["auth", "session"] });
-      router.refresh();
+    onSuccess: (result) => {
+      if (result === "sign-up") {
+        setMode("verify");
+        setNotice(`We sent a verification link to ${email}.`);
+      } else if (result === "forgot") {
+        setNotice(
+          "If an account exists for that email, a reset link is on its way.",
+        );
+      } else {
+        onSuccess?.();
+      }
     },
   });
 
@@ -41,148 +66,241 @@ export default function AuthForm() {
         provider,
         callbackURL: "/",
       });
-
-      if (result.error) {
-        throw new Error(
-          result.error.message ?? `Unable to sign in with ${provider}.`,
-        );
-      }
-
-      return result.data;
+      if (result.error) throw new Error(result.error.message);
     },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["auth", "session"] });
-      router.refresh();
-    },
+    onSuccess,
   });
 
-  const isPending = emailMutation.isPending || socialMutation.isPending;
-  const mutationError = emailMutation.error ?? socialMutation.error;
+  const resendMutation = useMutation({
+    mutationFn: async () => {
+      const result = await authClient.sendVerificationEmail({
+        email,
+        callbackURL: "/",
+      });
+      if (result.error) throw new Error(result.error.message);
+    },
+    onSuccess: () =>
+      setNotice(`A fresh verification link was sent to ${email}.`),
+  });
 
-  const submit = async (event: FormEvent<HTMLFormElement>) => {
+  const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    setError("");
+    setNotice("");
     emailMutation.reset();
 
-    const parsed =
-      mode === "sign-in"
-        ? signInSchema.safeParse({ email, password })
-        : signUpSchema.safeParse({ name, email, password });
-
-    if (!parsed.success) {
-      setError(
-        parsed.error.issues[0]?.message ?? "Check your details and try again.",
-      );
-      return;
+    if (mode === "forgot") {
+      if (!signInSchema.shape.email.safeParse(email).success) {
+        setError("Enter a valid email address.");
+        return;
+      }
+    } else {
+      const parsed =
+        mode === "sign-in"
+          ? signInSchema.safeParse({ email, password })
+          : signUpSchema.safeParse({ name, email, password });
+      if (!parsed.success) {
+        setError(
+          parsed.error.issues[0]?.message ??
+            "Check your details and try again.",
+        );
+        return;
+      }
     }
-
-    setError("");
     emailMutation.mutate();
   };
 
-  const signInWith = async (provider: "google" | "github") => {
-    setError("");
-    socialMutation.reset();
-    socialMutation.mutate(provider);
-  };
+  const isPending =
+    emailMutation.isPending ||
+    socialMutation.isPending ||
+    resendMutation.isPending;
+  const mutationError =
+    emailMutation.error ?? socialMutation.error ?? resendMutation.error;
 
-  return (
-    <div className="rounded-2xl border border-stone-200 bg-stone-50 p-6 sm:p-8">
-      <div className="mb-6 flex gap-6 border-b border-stone-200">
-        {(["sign-in", "sign-up"] as const).map((item) => (
-          <button
-            key={item}
-            type="button"
-            onClick={() => {
-              setMode(item);
-              emailMutation.reset();
-              socialMutation.reset();
-              setError("");
-            }}
-            className={`border-b-2 pb-3 text-sm font-semibold transition ${mode === item ? "border-emerald-700 text-emerald-800" : "border-transparent text-stone-500 hover:text-stone-900"}`}
-          >
-            {item === "sign-in" ? "Sign in" : "Create account"}
-          </button>
-        ))}
-      </div>
-
-      <div className="grid gap-3 sm:grid-cols-2">
-        <button
-          type="button"
-          disabled={isPending}
-          onClick={() => signInWith("google")}
-          className="rounded-xl border border-stone-300 bg-white px-4 py-3 text-sm font-semibold transition hover:border-stone-950 disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          Continue with Google
-        </button>
-        <button
-          type="button"
-          disabled={isPending}
-          onClick={() => signInWith("github")}
-          className="rounded-xl border border-stone-300 bg-white px-4 py-3 text-sm font-semibold transition hover:border-stone-950 disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          Continue with GitHub
-        </button>
-      </div>
-
-      <div className="my-6 flex items-center gap-3 text-xs uppercase tracking-[0.18em] text-stone-400">
-        <span className="h-px flex-1 bg-stone-200" />
-        or use email
-        <span className="h-px flex-1 bg-stone-200" />
-      </div>
-
-      <form onSubmit={submit} className="space-y-4">
-        {mode === "sign-up" ? (
-          <label className="block text-sm font-medium text-stone-700">
-            Name
-            <input
-              required
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              className="mt-2 w-full rounded-xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-emerald-700 focus:ring-2 focus:ring-emerald-700/15"
-            />
-          </label>
-        ) : null}
-        <label className="block text-sm font-medium text-stone-700">
-          Email
-          <input
-            required
-            type="email"
-            autoComplete="email"
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-            className="mt-2 w-full rounded-xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-emerald-700 focus:ring-2 focus:ring-emerald-700/15"
-          />
-        </label>
-        <label className="block text-sm font-medium text-stone-700">
-          Password
-          <input
-            required
-            minLength={8}
-            type="password"
-            autoComplete={
-              mode === "sign-in" ? "current-password" : "new-password"
-            }
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            className="mt-2 w-full rounded-xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-emerald-700 focus:ring-2 focus:ring-emerald-700/15"
-          />
-        </label>
-        {error || mutationError ? (
-          <p role="alert" className="text-sm text-red-700">
-            {error || mutationError?.message}
+  if (mode === "verify") {
+    return (
+      <div className="space-y-6 text-center">
+        <div className="mx-auto flex size-14 items-center justify-center rounded-full bg-cyan-400/10 text-cyan-300">
+          <ShieldCheck size={27} />
+        </div>
+        <div>
+          <h2 className="text-xl font-medium text-white">Check your inbox</h2>
+          <p className="mt-2 text-sm leading-6 text-white/55">{notice}</p>
+        </div>
+        {mutationError ? (
+          <p className="text-sm text-rose-300">
+            {errorMessage(mutationError, "Unable to send email.")}
           </p>
         ) : null}
         <button
+          type="button"
+          onClick={() => resendMutation.mutate()}
           disabled={isPending}
-          className="w-full rounded-xl bg-emerald-800 px-4 py-3 font-semibold text-white transition hover:bg-emerald-900 disabled:cursor-not-allowed disabled:opacity-60"
+          className="w-full rounded-xl border border-white/10 px-4 py-3 text-sm font-medium text-white transition hover:border-white/25 hover:bg-white/5 disabled:opacity-50"
+        >
+          {resendMutation.isPending
+            ? "Sending..."
+            : "Resend verification email"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setMode("sign-in")}
+          className="text-sm text-white/50 hover:text-white"
+        >
+          Back to sign in
+        </button>
+      </div>
+    );
+  }
+
+  const isForgot = mode === "forgot";
+  return (
+    <div>
+      <div className="mb-7 flex items-center justify-between">
+        <div>
+          <p className="text-xs font-medium uppercase tracking-[0.2em] text-cyan-300/80">
+            Northstar
+          </p>
+          <h2 className="mt-2 text-2xl font-medium text-white">
+            {isForgot
+              ? "Reset your password"
+              : mode === "sign-in"
+                ? "Welcome back"
+                : "Create your account"}
+          </h2>
+        </div>
+        <Mail className="text-white/25" size={21} />
+      </div>
+      {!isForgot ? (
+        <div className="mb-6 grid grid-cols-2 gap-2">
+          {(["sign-in", "sign-up"] as const).map((item) => (
+            <button
+              key={item}
+              type="button"
+              onClick={() => {
+                setMode(item);
+                setError("");
+                setNotice("");
+              }}
+              className={`rounded-lg px-3 py-2.5 text-sm transition ${mode === item ? "bg-white/10 text-white" : "text-white/45 hover:bg-white/5 hover:text-white"}`}
+            >
+              {item === "sign-in" ? "Sign in" : "Sign up"}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {!isForgot ? (
+        <div className="mb-5 grid grid-cols-2 gap-3">
+          <button
+            type="button"
+            disabled={isPending}
+            onClick={() => socialMutation.mutate("google")}
+            className="flex items-center justify-center gap-2 rounded-xl border border-white/10 px-3 py-3 text-sm text-white transition hover:border-white/25 hover:bg-white/5 disabled:opacity-50"
+          >
+            Google
+          </button>
+          <button
+            type="button"
+            disabled={isPending}
+            onClick={() => socialMutation.mutate("github")}
+            className="flex items-center justify-center gap-2 rounded-xl border border-white/10 px-3 py-3 text-sm text-white transition hover:border-white/25 hover:bg-white/5 disabled:opacity-50"
+          >
+            <GitBranch size={16} /> GitHub
+          </button>
+        </div>
+      ) : null}
+      {!isForgot ? (
+        <div className="mb-5 flex items-center gap-3 text-[11px] uppercase tracking-[0.16em] text-white/25">
+          <span className="h-px flex-1 bg-white/10" />
+          or email
+          <span className="h-px flex-1 bg-white/10" />
+        </div>
+      ) : null}
+      <form onSubmit={submit} className="space-y-4">
+        {mode === "sign-up" ? (
+          <label className="block text-sm text-white/60">
+            Name
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              required
+              className="mt-2 w-full rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none transition focus:border-cyan-300/60"
+            />
+          </label>
+        ) : null}
+        <label className="block text-sm text-white/60">
+          Email
+          <input
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            required
+            type="email"
+            autoComplete="email"
+            className="mt-2 w-full rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none transition focus:border-cyan-300/60"
+          />
+        </label>
+        {!isForgot ? (
+          <label className="block text-sm text-white/60">
+            Password
+            <input
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              required
+              minLength={8}
+              type="password"
+              autoComplete={
+                mode === "sign-in" ? "current-password" : "new-password"
+              }
+              className="mt-2 w-full rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none transition focus:border-cyan-300/60"
+            />
+          </label>
+        ) : null}
+        {mode === "sign-in" ? (
+          <button
+            type="button"
+            onClick={() => {
+              setMode("forgot");
+              setError("");
+            }}
+            className="text-sm text-cyan-300 hover:text-cyan-200"
+          >
+            Forgot password?
+          </button>
+        ) : null}
+        {error || mutationError ? (
+          <p role="alert" className="text-sm text-rose-300">
+            {error || errorMessage(mutationError, "Authentication failed.")}
+          </p>
+        ) : null}
+        {notice && isForgot ? (
+          <p className="text-sm leading-6 text-emerald-300">{notice}</p>
+        ) : null}
+        <button
+          disabled={isPending}
+          className="w-full rounded-xl bg-white px-4 py-3 text-sm font-semibold text-neutral-950 transition hover:bg-cyan-100 disabled:opacity-50"
         >
           {isPending
             ? "Please wait..."
-            : mode === "sign-in"
-              ? "Sign in"
-              : "Create account"}
+            : isForgot
+              ? "Send reset link"
+              : mode === "sign-in"
+                ? "Sign in"
+                : "Create account"}
         </button>
       </form>
+      {isForgot ? (
+        <button
+          type="button"
+          onClick={() => {
+            setMode("sign-in");
+            setNotice("");
+            setError("");
+          }}
+          className="mt-5 w-full text-center text-sm text-white/45 hover:text-white"
+        >
+          Back to sign in
+        </button>
+      ) : null}
     </div>
   );
 }
